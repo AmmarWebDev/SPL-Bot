@@ -50,7 +50,7 @@ const client = new Client({
   ],
 });
 
-const PREFIX = "%";
+const PREFIX = ":?";
 
 // Allowed servers
 const allowedGuilds = [
@@ -84,6 +84,7 @@ client.commands = new Collection();
 //   Register Slash Commands
 // ===========================
 const rest = new REST({ version: "10" }).setToken(process.env.BOT_TOKEN);
+const CLIENT_ID = process.env.CLIENT_ID; // <-- Add this to your .env
 
 client.once("clientReady", async (c) => {
   console.log(`✅ Logged in as ${c.user.tag}`);
@@ -105,16 +106,10 @@ client.once("clientReady", async (c) => {
   );
 
   try {
-    await rest.put(Routes.applicationCommands(c.user.id), {
+    await rest.put(Routes.applicationCommands(CLIENT_ID), {
       body: commandsBody,
     });
-
-    const GUILD_ID = "1414323168394477752"; // dev/test
-    await rest.put(Routes.applicationGuildCommands(c.user.id, GUILD_ID), {
-      body: commandsBody,
-    });
-
-    console.log("✅ Slash commands registered!");
+    console.log("✅ Global slash commands registered!");
   } catch (error) {
     console.error("❌ Failed to register slash commands:", error);
   }

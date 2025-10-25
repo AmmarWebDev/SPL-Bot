@@ -3,8 +3,9 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  EmbedBuilder,
 } from "discord.js";
-import axios from "axios";
+import { models } from "../../models/leagues.model.js"; // 👈 import models
 
 export default {
   data: new SlashCommandBuilder()
@@ -22,19 +23,21 @@ export default {
   async run({ message, interaction }) {
     const ctx = interaction ?? message;
 
-    // only allow specific user (same check as original)
+    // only allow specific user
     const allowedUser = "759869571632332851";
     const userId = interaction ? interaction.user.id : message.author.id;
     if (userId !== allowedUser) {
       const replyOpt = interaction
         ? { content: "❌ Not allowed.", ephemeral: true }
         : { content: "❌ Not allowed." };
-      return ctx.reply ? ctx.reply(replyOpt) : message.reply(replyOpt);
+      return interaction
+        ? interaction.reply(replyOpt)
+        : message.reply(replyOpt);
     }
 
     const url = interaction
       ? interaction.options.getString("url")
-      : message.content.split(" ")[1];
+      : (message.content.split(" ")[1] || "").trim();
     if (!url)
       return interaction
         ? interaction.reply({
@@ -44,7 +47,7 @@ export default {
         : message.reply("❌ Usage: `?recordStats <message URL>`");
 
     try {
-      await handleRecordStats(url, ctx);
+      await handleRecordStats(url, ctx, interaction);
     } catch (err) {
       console.error("❌ Error in recordstats.run:", err);
       if (interaction) {
@@ -66,37 +69,48 @@ export default {
   },
 };
 
-// ---------------------- helpers ----------------------
-async function handleRecordStats(url, ctx) {
+// ---------- HELPERS ----------
+async function handleRecordStats(url, ctx, interaction) {
   try {
     const match = url.match(
       /discord(?:app)?\.com\/channels\/\d+\/(\d+)\/(\d+)/
     );
     if (!match) {
-      return ctx.reply
-        ? await ctx.reply({
+      return interaction
+        ? await interaction.reply({
             content: "❌ Invalid message URL.",
             ephemeral: true,
           })
-        : ctx.channel.send("❌ Invalid message URL.");
+        : await ctx.reply("❌ Invalid message URL.");
     }
 
     const [, channelId, messageId] = match;
-    const channel = await (ctx.client
-      ? ctx.client.channels.fetch(channelId)
-      : ctx.guild.client.channels.fetch(channelId));
+    const client = interaction ? interaction.client : ctx.client;
+    const channel = await client.channels.fetch(channelId);
     const fetchedMessage = await channel.messages.fetch(messageId);
     const channelName = fetchedMessage.channel.name.toLowerCase();
 
-    let targetEndpoint = null;
-    if (channelName.includes("cwc")) targetEndpoint = "cwc";
-    else if (channelName.includes("euro")) targetEndpoint = "euros";
-    else
-      return ctx.reply
-        ? await ctx.reply({ content: "❌ Unknown channel.", ephemeral: true })
-        : ctx.channel.send("❌ Unknown channel.");
+    // determine league
+    let targetLeague = Object.keys(models).find((k) => channelName.includes(k));
+    if (!targetLeague) {
+      return interaction
+        ? await interaction.reply({
+            content: "❌ Unknown channel.",
+            ephemeral: true,
+          })
+        : await ctx.reply("❌ Unknown channel.");
+    }
 
     const players = await parsePlayerStats(fetchedMessage);
+    if (players.length === 0) {
+      return interaction
+        ? await interaction.reply({
+            content: "❌ No player stats found in message.",
+            ephemeral: true,
+          })
+        : await ctx.reply("❌ No player stats found in message.");
+    }
+
     const requestPayload = players.map((p) => ({
       userId: p.userId,
       goals: p.goals,
@@ -105,14 +119,20 @@ async function handleRecordStats(url, ctx) {
       teamId: p.teamId,
     }));
 
-    const previewText = requestPayload
-      .map(
-        (p, i) =>
-          `${i + 1}. <@${p.userId}>\nGoals: ${p.goals}, Assists: ${
-            p.assists
-          }, Clean Sheets: ${p.cleansheets}`
+    const previewEmbed = new EmbedBuilder()
+      .setTitle(`📝 Preview of stats — ${targetLeague.toUpperCase()}`)
+      .setDescription(
+        requestPayload
+          .map(
+            (p, i) =>
+              `**${i + 1}. <@${p.userId}>**\n⚽ Goals: ${
+                p.goals
+              } | 👟 Assists: ${p.assists} | 🧤 Clean Sheets: ${p.cleansheets}`
+          )
+          .join("\n\n")
       )
-      .join("\n\n");
+      .setColor("Blue")
+      .setFooter({ text: "Click ✅ to confirm or ❌ to cancel." });
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -125,34 +145,28 @@ async function handleRecordStats(url, ctx) {
         .setStyle(ButtonStyle.Danger)
     );
 
-    // send preview
     let previewMsg;
-    if (ctx.reply) {
-      await ctx.reply({
-        content:
-          "📝 **Preview of stats**. Click ✅ to confirm or ❌ to cancel.\n\n" +
-          previewText,
+    if (interaction) {
+      await interaction.reply({
+        embeds: [previewEmbed],
         components: [row],
         ephemeral: true,
         allowedMentions: { parse: [] },
       });
-      previewMsg = await ctx.fetchReply();
+      previewMsg = await interaction.fetchReply();
     } else {
       previewMsg = await ctx.channel.send({
-        content:
-          "📝 **Preview of stats**. Click ✅ to confirm or ❌ to cancel.\n\n" +
-          previewText,
+        embeds: [previewEmbed],
         components: [row],
         allowedMentions: { parse: [] },
       });
     }
 
-    const msg = previewMsg;
+    const actorId = interaction ? interaction.user.id : ctx.author.id;
     const filter = (i) =>
-      ["confirm", "cancel"].includes(i.customId) &&
-      i.user.id === (ctx.user?.id || ctx.author.id);
+      ["confirm", "cancel"].includes(i.customId) && i.user.id === actorId;
 
-    const collector = msg.createMessageComponentCollector({
+    const collector = previewMsg.createMessageComponentCollector({
       filter,
       time: 60000,
     });
@@ -160,46 +174,74 @@ async function handleRecordStats(url, ctx) {
     collector.on("collect", async (i) => {
       if (i.customId === "confirm") {
         let successCount = 0;
+        const Model = models[targetLeague];
+
         for (const p of requestPayload) {
           try {
-            await axios.post(
-              `https://spl-production.up.railway.app/${targetEndpoint}`,
-              p
-            );
+            let player = await Model.findOne({ userId: p.userId });
+            if (!player) {
+              player = new Model({
+                userId: p.userId,
+                goals: Number(p.goals) || 0,
+                assists: Number(p.assists) || 0,
+                cleansheets: Number(p.cleansheets) || 0,
+                teamId: p.teamId,
+              });
+            } else {
+              player.goals += Number(p.goals) || 0;
+              player.assists += Number(p.assists) || 0;
+              player.cleansheets += Number(p.cleansheets) || 0;
+              player.teamId = p.teamId;
+            }
+            await player.save();
             successCount++;
           } catch (err) {
-            console.error(`❌ Failed for ${p.userId}:`, err.message);
+            console.error(`❌ Failed for ${p.userId}:`, err);
           }
         }
+
         await i.update({
-          content: `✅ Recorded stats for ${successCount} players.`,
+          content: `✅ Recorded stats for ${successCount} players in **${targetLeague}**.`,
           components: [],
+          embeds: [],
         });
       } else {
-        await i.update({ content: "❌ Cancelled.", components: [] });
+        await i.update({
+          content: "❌ Cancelled.",
+          components: [],
+          embeds: [],
+        });
       }
     });
 
     collector.on("end", async (collected) => {
       if (collected.size === 0) {
         try {
-          await msg.edit({
-            content: "⌛ Timed out. Cancelled.",
-            components: [],
-          });
-        } catch (err) {
-          // ignore
-        }
+          if (interaction) {
+            await interaction.editReply({
+              content: "⌛ Timed out. Cancelled.",
+              components: [],
+              embeds: [],
+            });
+          } else {
+            await previewMsg.edit({
+              content: "⌛ Timed out. Cancelled.",
+              components: [],
+              embeds: [],
+            });
+          }
+        } catch (err) {}
       }
     });
   } catch (err) {
     console.error("❌ Error in handleRecordStats:", err);
-    return ctx.reply
-      ? ctx.reply({ content: "❌ Failed to process.", ephemeral: true })
-      : ctx.channel.send("❌ Failed to process.");
+    return interaction
+      ? interaction.reply({ content: "❌ Failed to process.", ephemeral: true })
+      : ctx.reply("❌ Failed to process.");
   }
 }
 
+// ---------- STATS PARSER ----------
 const parsePlayerStats = async (msg) => {
   const lines = msg.content.split("\n");
   const goals = {};
@@ -245,7 +287,28 @@ const parsePlayerStats = async (msg) => {
   const players = [];
 
   for (const userId of allUserIds) {
-    const member = await msg.guild.members.fetch(userId);
+    let member;
+    try {
+      member = await msg.guild.members.fetch(userId);
+    } catch (err) {
+      if (err.code === 10007) {
+        console.warn(`⚠️ User ${userId} not found in guild.`);
+        // fallback to user fetch (no roles/cleansheets possible)
+        await msg.client.users.fetch(userId).catch(() => null);
+
+        players.push({
+          userId,
+          goals: goals[userId] || 0,
+          assists: assists[userId] || 0,
+          cleansheets: 0,
+          teamId: null,
+        });
+        continue;
+      } else {
+        throw err;
+      }
+    }
+
     const matchingRoles = member.roles.cache.filter((role) =>
       teamRoles.includes(role.id)
     );
