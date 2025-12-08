@@ -21,7 +21,7 @@ import { log, initLogger } from "./functions/log.js";
 // ===========================
 import check from "./commands/utils/check.js";
 import viewmembers from "./commands/mod/viewmembers.js";
-import recordstats from "./commands/stats/recordstats.js";
+import recordStats from "./commands/stats/recordStats.js";
 import teamsView from "./commands/teams/teams-view.js";
 import teamAdd from "./commands/teams/team-add.js";
 import teamDelete from "./commands/teams/team-delete.js";
@@ -35,6 +35,10 @@ import demote from "./commands/teams/demote.js";
 import rosters from "./commands/teams/rosters.js";
 import managerList from "./commands/teams/manager-list.js";
 import disband from "./commands/teams/disband.js";
+import singleRecord from "./commands/stats/singleRecord.js";
+import bulkRecord from "./commands/stats/bulkRecord.js";
+import setTopPlayers from "./commands/stats/setTopPlayers.js";
+import updateTopPlayers from "./commands/stats/updateTopPlayers.js";
 
 // Load .env from project root
 const __filename = fileURLToPath(import.meta.url);
@@ -55,7 +59,6 @@ const PREFIX = ":?";
 // Allowed servers
 const allowedGuilds = [
   "759870262262628352", // my server
-  "1414323168394477752", // testing environment
   "1257473566325084310", // SPL server
 ];
 
@@ -64,7 +67,7 @@ client.commands = new Collection();
 [
   check,
   viewmembers,
-  recordstats,
+  recordStats,
   teamsView,
   teamAdd,
   teamDelete,
@@ -78,6 +81,10 @@ client.commands = new Collection();
   rosters,
   managerList,
   disband,
+  singleRecord,
+  bulkRecord,
+  setTopPlayers,
+  updateTopPlayers
 ].forEach((cmd) => client.commands.set(cmd.name.toLowerCase(), cmd));
 
 // ===========================
@@ -101,7 +108,7 @@ client.once("clientReady", async (c) => {
   initLogger(c);
 
   // Build slash command JSON array
-  const commandsBody = [check, viewmembers, recordstats].map((cmd) =>
+  const commandsBody = [check, viewmembers, recordStats].map((cmd) =>
     cmd.data.toJSON()
   );
 

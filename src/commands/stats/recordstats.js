@@ -5,11 +5,11 @@ import {
   ButtonStyle,
   EmbedBuilder,
 } from "discord.js";
-import { models } from "../../models/leagues.model.js"; // 👈 import models
+import { models } from "../../models/leagues.model.js";
 
 export default {
   data: new SlashCommandBuilder()
-    .setName("recordstats")
+    .setName("record-stats")
     .setDescription("Record stats from a message URL")
     .addStringOption((opt) =>
       opt
@@ -18,38 +18,44 @@ export default {
         .setRequired(true)
     ),
 
-  name: "recordstats",
+  name: "record-stats",
 
-  async run({ message, interaction }) {
+  /**
+   * run signature accepts object: { message, interaction, autoConfirm }
+   * - message: the invoking Message object (prefix)
+   * - interaction: the Interaction (slash)
+   * - autoConfirm: boolean (when true, skip preview and save immediately)
+   */
+  async run({ message, interaction, autoConfirm = false } = {}) {
     const ctx = interaction ?? message;
 
     // only allow specific user
     const allowedUser = "759869571632332851";
-    const userId = interaction ? interaction.user.id : message.author.id;
+    const userId = interaction ? interaction.user.id : message?.author?.id;
     if (userId !== allowedUser) {
       const replyOpt = interaction
         ? { content: "❌ Not allowed.", ephemeral: true }
         : { content: "❌ Not allowed." };
       return interaction
         ? interaction.reply(replyOpt)
-        : message.reply(replyOpt);
+        : message?.reply?.(replyOpt);
     }
 
     const url = interaction
       ? interaction.options.getString("url")
-      : (message.content.split(" ")[1] || "").trim();
+      : (message?.content?.split(" ")[1] || "").trim();
     if (!url)
       return interaction
         ? interaction.reply({
-            content: "❌ Usage: `/recordstats <message URL>`",
+            content: "❌ Usage: `/record-stats <message URL>`",
             ephemeral: true,
           })
-        : message.reply("❌ Usage: `?recordStats <message URL>`");
+        : message?.reply?.("❌ Usage: `:?record-stats <message URL>`");
 
     try {
-      await handleRecordStats(url, ctx, interaction);
+      await handleRecordStats(url, ctx, interaction, { autoConfirm });
     } catch (err) {
-      console.error("❌ Error in recordstats.run:", err);
+      console.error("❌ Error in recordStats.run:", err);
       if (interaction) {
         if (interaction.replied || interaction.deferred) {
           await interaction.followUp({
@@ -63,14 +69,14 @@ export default {
           });
         }
       } else {
-        await message.reply("❌ Failed to process.");
+        await message?.reply?.("❌ Failed to process.");
       }
     }
   },
 };
 
 // ---------- HELPERS ----------
-async function handleRecordStats(url, ctx, interaction) {
+async function handleRecordStats(url, ctx, interaction, { autoConfirm = false } = {}) {
   try {
     const match = url.match(
       /discord(?:app)?\.com\/channels\/\d+\/(\d+)\/(\d+)/
@@ -89,6 +95,43 @@ async function handleRecordStats(url, ctx, interaction) {
     const channel = await client.channels.fetch(channelId);
     const fetchedMessage = await channel.messages.fetch(messageId);
     const channelName = fetchedMessage.channel.name.toLowerCase();
+
+    // --- refuse if bot already reacted with ✅ on the target message ---
+    try {
+      let alreadyRecorded = false;
+      const clientUserId = client.user?.id;
+
+      // look for the white_check_mark reaction
+      const checkReaction = fetchedMessage.reactions.cache.find(
+        (r) => r.emoji && r.emoji.name === "✅"
+      );
+
+      if (checkReaction) {
+        if (checkReaction.me) {
+          alreadyRecorded = true;
+        } else if (clientUserId && checkReaction.users.cache.has(clientUserId)) {
+          alreadyRecorded = true;
+        } else {
+          const users = await checkReaction.users.fetch().catch(() => null);
+          if (users && clientUserId && users.has(clientUserId)) alreadyRecorded = true;
+        }
+      }
+
+      if (alreadyRecorded) {
+        return interaction
+          ? await interaction.reply({
+              content:
+                "❌ This message has already been recorded — bot reaction detected. (No duplicate records allowed.)",
+              ephemeral: true,
+            })
+          : await ctx.reply(
+              "❌ This message has already been recorded — bot reaction detected. (No duplicate records allowed.)"
+            );
+      }
+    } catch (err) {
+      console.warn("⚠️ Reaction-check failed, continuing:", err);
+    }
+    // --- end of reaction check ---
 
     // determine league
     let targetLeague = Object.keys(models).find((k) => channelName.includes(k));
@@ -119,6 +162,28 @@ async function handleRecordStats(url, ctx, interaction) {
       teamId: p.teamId,
     }));
 
+    // If autoConfirm, skip preview and save immediately
+    if (autoConfirm) {
+      const Model = models[targetLeague];
+      const successCount = await savePayload(Model, requestPayload, fetchedMessage, targetLeague);
+      // reply back minimally (non-ephemeral)
+      try {
+        if (interaction) {
+          // if slash + autoConfirm, reply ephemeral to the command issuer
+          await interaction.reply({
+            content: `✅ Recorded stats for ${successCount} players in **${targetLeague}**.`,
+            ephemeral: true,
+          });
+        } else {
+          await ctx.reply(`✅ Recorded stats for ${successCount} players in **${targetLeague}**.`);
+        }
+      } catch (err) {
+        // ignore reply errors
+      }
+      return;
+    }
+
+    // Build preview and interactive confirmation (original behavior)
     const previewEmbed = new EmbedBuilder()
       .setTitle(`📝 Preview of stats — ${targetLeague.toUpperCase()}`)
       .setDescription(
@@ -173,32 +238,8 @@ async function handleRecordStats(url, ctx, interaction) {
 
     collector.on("collect", async (i) => {
       if (i.customId === "confirm") {
-        let successCount = 0;
         const Model = models[targetLeague];
-
-        for (const p of requestPayload) {
-          try {
-            let player = await Model.findOne({ userId: p.userId });
-            if (!player) {
-              player = new Model({
-                userId: p.userId,
-                goals: Number(p.goals) || 0,
-                assists: Number(p.assists) || 0,
-                cleansheets: Number(p.cleansheets) || 0,
-                teamId: p.teamId,
-              });
-            } else {
-              player.goals += Number(p.goals) || 0;
-              player.assists += Number(p.assists) || 0;
-              player.cleansheets += Number(p.cleansheets) || 0;
-              player.teamId = p.teamId;
-            }
-            await player.save();
-            successCount++;
-          } catch (err) {
-            console.error(`❌ Failed for ${p.userId}:`, err);
-          }
-        }
+        const successCount = await savePayload(Model, requestPayload, fetchedMessage, targetLeague);
 
         await i.update({
           content: `✅ Recorded stats for ${successCount} players in **${targetLeague}**.`,
@@ -241,45 +282,137 @@ async function handleRecordStats(url, ctx, interaction) {
   }
 }
 
+/**
+ * Save requestPayload into the DB (Model) and react to source message.
+ * Returns number of players successfully saved (rows).
+ */
+async function savePayload(Model, requestPayload, sourceMessage, targetLeague) {
+  let successCount = 0;
+  for (const p of requestPayload) {
+    try {
+      let player = await Model.findOne({ userId: p.userId });
+      if (!player) {
+        player = new Model({
+          userId: p.userId,
+          goals: Number(p.goals) || 0,
+          assists: Number(p.assists) || 0,
+          cleansheets: Number(p.cleansheets) || 0,
+          teamId: p.teamId,
+        });
+      } else {
+        player.goals += Number(p.goals) || 0;
+        player.assists += Number(p.assists) || 0;
+        player.cleansheets += Number(p.cleansheets) || 0;
+        player.teamId = p.teamId;
+      }
+      await player.save();
+      successCount++;
+    } catch (err) {
+      console.error(`❌ Failed for ${p.userId}:`, err);
+    }
+  }
+
+  // react with ✅ on the recorded message (best-effort)
+  try {
+    if (sourceMessage && sourceMessage.react) {
+      await sourceMessage.react("✅");
+    }
+  } catch (err) {
+    console.warn("⚠️ Could not add reaction to the recorded message:", err);
+  }
+
+  return successCount;
+}
+
 // ---------- STATS PARSER ----------
+// Updated counting logic: prefer emoji-counts (old format). If not >1, look for "2x" / "3x" before/after the emoji.
 const parsePlayerStats = async (msg) => {
-  const lines = msg.content.split("\n");
+  const lines = (msg.content || "").split("\n");
   const goals = {};
   const assists = {};
   const cleanSheets = new Set();
   const teamRoles = [];
 
   const teamMentionRegex = /<@&(\d+)>/g;
-  for (const match of msg.content.matchAll(teamMentionRegex)) {
+  for (const match of (msg.content || "").matchAll(teamMentionRegex)) {
     teamRoles.push(match[1]);
   }
 
+  // helper to extract multiplier near an emoji (supports "2x" and "3x", lowercase/uppercase x and ×)
+  const extractMultiplier = (line, emojiPattern) => {
+    const beforeRegex = new RegExp(`(\\d+)\\s*[x×]\\s*(?:${emojiPattern})`, "i");
+    const afterRegex = new RegExp(`(?:${emojiPattern})\\s*[x×]\\s*(\\d+)`, "i");
+
+    let m = line.match(beforeRegex);
+    if (m && m[1]) return parseInt(m[1], 10);
+    m = line.match(afterRegex);
+    if (m && m[1]) return parseInt(m[1], 10);
+
+    const spacedBefore = new RegExp(`(\\d+)\\s*[x×]\\s*.*(?:${emojiPattern})`, "i");
+    const spacedAfter = new RegExp(`(?:${emojiPattern}).*\\s*[x×]\\s*(\\d+)`, "i");
+
+    m = line.match(spacedBefore);
+    if (m && m[1]) return parseInt(m[1], 10);
+    m = line.match(spacedAfter);
+    if (m && m[1]) return parseInt(m[1], 10);
+
+    return null;
+  };
+
+  // GOALS
   for (const line of lines) {
     const goalMatch = line.match(/<@!?(\d+)>/);
-    if (goalMatch) {
-      const userId = goalMatch[1];
-      const goalCount =
-        (line.match(/⚽/g) || []).length +
-        (line.match(/<:Goal:\d+>/g) || []).length;
-      if (goalCount > 0) goals[userId] = (goals[userId] || 0) + goalCount;
+    if (!goalMatch) continue;
+    const userId = goalMatch[1];
+
+    const nativeCount = (line.match(/⚽/g) || []).length;
+    const customCount = (line.match(/<:Goal:\d+>/g) || []).length;
+    const emojiCount = nativeCount + customCount;
+
+    let goalCount = 0;
+    if (emojiCount > 1) {
+      goalCount = emojiCount;
+    } else {
+      const multiplier = extractMultiplier(line, "⚽|<:Goal:\\d+>");
+      if (multiplier && multiplier > 0) {
+        goalCount = multiplier;
+      } else {
+        goalCount = emojiCount;
+      }
     }
+
+    if (goalCount > 0) goals[userId] = (goals[userId] || 0) + goalCount;
   }
 
+  // ASSISTS
   for (const line of lines) {
     const assistMatch = line.match(/<@!?(\d+)>/);
-    if (assistMatch) {
-      const userId = assistMatch[1];
-      const assistCount =
-        (line.match(/👟/g) || []).length +
-        (line.match(/<:Assist:\d+>/g) || []).length;
-      if (assistCount > 0)
-        assists[userId] = (assists[userId] || 0) + assistCount;
+    if (!assistMatch) continue;
+    const userId = assistMatch[1];
+
+    const nativeCount = (line.match(/👟/g) || []).length;
+    const customCount = (line.match(/<:Assist:\d+>/g) || []).length;
+    const emojiCount = nativeCount + customCount;
+
+    let assistCount = 0;
+    if (emojiCount > 1) {
+      assistCount = emojiCount;
+    } else {
+      const multiplier = extractMultiplier(line, "👟|<:Assist:\\d+>");
+      if (multiplier && multiplier > 0) {
+        assistCount = multiplier;
+      } else {
+        assistCount = emojiCount;
+      }
     }
+
+    if (assistCount > 0) assists[userId] = (assists[userId] || 0) + assistCount;
   }
 
+  // CLEAN SHEETS: look for custom emoji followed by ✅, record role id from emoji id
   const cleanSheetRegex = /<:.*?:(\d+)> ✅/g;
   let match;
-  while ((match = cleanSheetRegex.exec(msg.content)) !== null) {
+  while ((match = cleanSheetRegex.exec(msg.content || "")) !== null) {
     cleanSheets.add(match[1]);
   }
 
@@ -291,9 +424,8 @@ const parsePlayerStats = async (msg) => {
     try {
       member = await msg.guild.members.fetch(userId);
     } catch (err) {
-      if (err.code === 10007) {
+      if (err?.code === 10007) {
         console.warn(`⚠️ User ${userId} not found in guild.`);
-        // fallback to user fetch (no roles/cleansheets possible)
         await msg.client.users.fetch(userId).catch(() => null);
 
         players.push({

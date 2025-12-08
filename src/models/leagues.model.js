@@ -24,11 +24,21 @@ const PL = statsConnection.model("PL", playerSchema, "PL");
 const SerieA = statsConnection.model("SerieA", playerSchema, "SerieA");
 const Ligue1 = statsConnection.model("Ligue1", playerSchema, "Ligue1");
 const Bundesliga = statsConnection.model("Bundesliga", playerSchema, "Bundesliga");
+const CopaDelRey = statsConnection.model("CopaDelRey", playerSchema, "CopaDelRey");
+const FACup = statsConnection.model("FACup", playerSchema, "FACup");
+const CoppaItalia = statsConnection.model("CoppaItalia", playerSchema, "CoppaItalia");
+const CoupeDeFrance = statsConnection.model("CoupeDeFrance", playerSchema, "CoupeDeFrance");
+const DFBPokal = statsConnection.model("DFBPokal", playerSchema, "DFBPokal");
 
 export const models = {
   "la-liga": LaLiga,
-  pl: PL,
+  "pl": PL,
   "serie-a": SerieA,
   "ligue-1": Ligue1,
-  bundesliga: Bundesliga,
+  "bundesliga": Bundesliga,
+  "copadel": CopaDelRey,
+  "fa-cup": FACup,
+  "coppa-italia": CoppaItalia,
+  "coupedefrance": CoupeDeFrance,
+  "dfb-pokal": DFBPokal,
 };
