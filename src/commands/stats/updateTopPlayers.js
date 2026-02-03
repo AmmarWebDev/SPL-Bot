@@ -1,48 +1,67 @@
 // src/commands/stats/updateTopPlayers.js
-import { PermissionsBitField } from "discord.js";
+import { PermissionsBitField, EmbedBuilder } from "discord.js";
 import mongoose from "mongoose";
 import Channels from "../../models/channels.model.js";
 
 /** Helpers */
-// remove trailing "-result" suffix and trim
+
+// Hardcoded season label (always Season 6)
+const SEASON_LABEL = "Season 6";
+
+// strip trailing "-result" and trim
 function normalizeLeagueSlug(slug) {
   if (!slug) return null;
   return String(slug).replace(/-result$/i, "").trim();
 }
 
-// basic slug -> normalized lower string
+// normalize to lower alphanum
 function normalizeSlug(slug) {
   return String(slug || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-// slug -> PascalCase candidate: la-liga -> LaLiga
+// slug -> PascalCase candidate
 function slugToPascal(slug) {
   return String(slug || "")
     .split(/[^a-z0-9]+/i)
     .filter(Boolean)
-    .map((w) => (w.length <= 3 ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1).toLowerCase()))
+    .map((w) =>
+      w.length <= 3 ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1).toLowerCase()
+    )
     .join("");
 }
 
-// pretty name for display: la-liga -> "La Liga"
+// Pretty display name
 function prettyLeagueName(slug) {
   if (!slug) return "";
   return String(slug)
     .split(/[^a-z0-9]+/i)
     .filter(Boolean)
-    .map((w) => (w.length <= 3 ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1).toLowerCase()))
+    .map((w) =>
+      w.length <= 3 ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1).toLowerCase()
+    )
     .join(" ");
 }
 
-// tolerant regex for matching header in messages/embeds
-function buildHeaderRegex(pretty, type) {
-  const safe = pretty.replace(/[-\s]+/g, "\\s*");
-  return new RegExp(`top\\s*10\\s*${safe}.*${type}`, "i");
+// Escape regex special characters
+function escapeRegex(s) {
+  return String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// format exactly as requested
+function buildHeaderRegex(pretty, type) {
+  const safe = escapeRegex(pretty).replace(/[\s-]+/g, "\\s*");
+  return new RegExp(`top\\s*10\\s+${safe}.*${escapeRegex(type)}`, "i");
+}
+
 function formatTopList(items, label, prettyLeague) {
-  const header = `# Top 10 ${prettyLeague} ${label === "Goals" ? "Scorers" : "Assisters"}!\n\n`;
+  const containsSeason =
+    String(prettyLeague || "").toLowerCase().includes(SEASON_LABEL.toLowerCase());
+
+  const headerBase = containsSeason
+    ? `# Top 10 ${prettyLeague} ${label === "Goals" ? "Scorers" : "Assisters"}!\n\n`
+    : `# Top 10 ${SEASON_LABEL} ${prettyLeague} ${
+        label === "Goals" ? "Scorers" : "Assisters"
+      }!\n\n`;
+
   const lines = items.map((p, i) => {
     const mention = `<@${p.userId}>`;
     const count = p.count ?? 0;
@@ -51,263 +70,159 @@ function formatTopList(items, label, prettyLeague) {
     if (i === 2) return `🥉 ${mention} — ${count} ${label.toLowerCase()}`;
     return `${mention} --- ${count} ${label.toLowerCase()}`;
   });
-  return header + (lines.length ? lines.join("\n") : `No ${label.toLowerCase()} yet.`);
+
+  return headerBase + (lines.length ? lines.join("\n") : `No ${label.toLowerCase()} yet.`);
 }
 
 export default {
   name: "update-top-players",
 
-  /**
-   * Admin-only. Updates ALL leagues stored with type: "top-players".
-   * Supports config fields:
-   *  - league (slug, e.g. "la-liga" or "la-liga-result")
-   *  - collectionName (optional explicit Mongo collection name e.g. "LaLiga")
-   *  - topPlayersChannelUrl | topPlayersUrl | url
-   */
   async run(options = {}) {
     const { message } = options;
 
-    // guards
-    if (!message || !message.member) return message?.reply?.("❌ This command must be run in a server channel.");
+    if (!message || !message.member) {
+      return message?.reply?.("❌ This command must be run in a server channel.");
+    }
+
     if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
       return message.reply("❌ You need the **Administrator** permission to use this command.");
     }
 
-    // load configs
     const configs = await Channels.find({ type: "top-players" }).lean();
-    if (!configs || configs.length === 0) {
-      return message.reply("⚠️ No `top-players` configurations found in the database.");
+    if (!configs.length) {
+      return message.reply("⚠️ No `top-players` configurations found.");
     }
+
+    let statusMsg = await message.reply("🔄 Updating top players...");
 
     const statsUri = process.env.MONGODB_STATS_URI;
     if (!statsUri) {
-      console.error("MONGODB_STATS_URI missing in .env");
-      return message.reply("❌ Server misconfiguration: stats DB URI not found.");
+      return statusMsg.edit("❌ Stats DB URI missing.");
     }
 
-    // connect to stats DB
-    const statsConn = mongoose.createConnection(statsUri, {});
-    try {
-      await statsConn.asPromise();
-    } catch (err) {
-      console.error("Failed to connect to stats DB:", err);
-      return message.reply("❌ Failed to connect to stats DB. See console.");
-    }
+    const statsConn = mongoose.createConnection(statsUri);
+    await statsConn.asPromise();
 
-    // get collections list to improve matching (optional)
-    let statsCollections = [];
-    try {
-      const cols = await statsConn.db.listCollections().toArray();
-      statsCollections = cols.map((c) => String(c.name));
-    } catch (e) {
-      statsCollections = [];
-    }
+    const cols = await statsConn.db.listCollections().toArray();
+    const statsCollections = cols.map((c) => c.name);
 
-    // cache guild member existence
     const memberCache = new Map();
-    async function memberExists(userId) {
-      if (!userId) return false;
-      if (memberCache.has(userId)) return memberCache.get(userId);
-      if (message.guild.members.cache.has(userId)) {
-        memberCache.set(userId, true);
-        return true;
-      }
+    async function memberExists(id) {
+      if (memberCache.has(id)) return memberCache.get(id);
       try {
-        await message.guild.members.fetch(userId);
-        memberCache.set(userId, true);
+        await message.guild.members.fetch(id);
+        memberCache.set(id, true);
         return true;
       } catch {
-        memberCache.set(userId, false);
+        memberCache.set(id, false);
         return false;
       }
     }
 
-    const results = { updated: [], created: [], skipped: [], errors: [] };
+    const results = { updated: [], created: [] };
 
-    for (const cfg of configs) {
-      try {
-        // normalize league slug (strip "-result" suffix)
-        const rawLeague = cfg.league;
-        const leagueSlug = normalizeLeagueSlug(rawLeague);
-        if (!leagueSlug) {
-          results.skipped.push({ cfg, reason: "missing league field" });
-          continue;
-        }
+    async function processSingleConfig(cfg) {
+      const slug = normalizeLeagueSlug(cfg.league);
+      if (!slug) return;
 
-        // pick collectionName candidates
-        const explicitColl = cfg.collectionName && String(cfg.collectionName).trim();
-        const candidates = [];
-        if (explicitColl) candidates.push(explicitColl);
+      const collectionName =
+        cfg.collectionName ||
+        statsCollections.find((c) =>
+          c.toLowerCase().includes(normalizeSlug(slug))
+        );
 
-        const pascal = slugToPascal(leagueSlug); // LaLiga or DFBPokal
-        const normalized = normalizeSlug(leagueSlug); // laliga
-        const fallbackJoin = leagueSlug
-          .split(/[^a-z0-9]+/i)
-          .filter(Boolean)
-          .map((w) => (w.length <= 3 ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1)))
-          .join("");
+      if (!collectionName) return;
 
-        [pascal, fallbackJoin, normalized].forEach((c) => {
-          if (c && !candidates.includes(c)) candidates.push(c);
-        });
+      const coll = statsConn.db.collection(collectionName);
 
-        // try to resolve to a real collection name (if collections list available)
-        let collectionName = null;
-        if (statsCollections.length) {
-          const exact = statsCollections.find((n) =>
-            candidates.some((cand) => String(n).toLowerCase() === String(cand).toLowerCase())
-          );
-          if (exact) collectionName = exact;
-          else {
-            const incl = statsCollections.find((n) => String(n).toLowerCase().includes(normalized));
-            if (incl) collectionName = incl;
-            else {
-              const incl2 = statsCollections.find((n) => String(n).toLowerCase().includes(pascal.toLowerCase()));
-              if (incl2) collectionName = incl2;
-            }
-          }
-        }
+      const scorers = await coll
+        .find({ goals: { $gt: 0 } })
+        .sort({ goals: -1 })
+        .limit(20)
+        .toArray();
 
-        if (!collectionName) collectionName = candidates[0];
-        if (!collectionName) {
-          results.skipped.push({ league: leagueSlug, reason: "no candidate collection name", tried: candidates });
-          continue;
-        }
+      const assisters = await coll
+        .find({ assists: { $gt: 0 } })
+        .sort({ assists: -1 })
+        .limit(20)
+        .toArray();
 
-        const coll = statsConn.db.collection(collectionName);
-
-        // fetch generous rows so we can filter out non-members (avoid missing legitimate top players)
-        const FETCH_LIMIT = 500;
-
-        // Raw fetch: scorers and assisters (positive stats only)
-        const rawScorersRaw = await coll
-          .find({ goals: { $gt: 0 } })
-          .sort({ goals: -1, assists: -1, userId: 1 })
-          .limit(FETCH_LIMIT)
-          .toArray()
-          .catch(() => []);
-
-        const rawAssistersRaw = await coll
-          .find({ assists: { $gt: 0 } })
-          .sort({ assists: -1, goals: -1, userId: 1 })
-          .limit(FETCH_LIMIT)
-          .toArray()
-          .catch(() => []);
-
-        // HARD FILTER deleted / non-existing guild members BEFORE building final top list
-        const rawScorers = [];
-        for (const row of rawScorersRaw) {
-          if (!row || !row.userId) continue;
-          if (await memberExists(row.userId)) rawScorers.push(row);
-          if (rawScorers.length >= FETCH_LIMIT) break;
-        }
-
-        const rawAssisters = [];
-        for (const row of rawAssistersRaw) {
-          if (!row || !row.userId) continue;
-          if (await memberExists(row.userId)) rawAssisters.push(row);
-          if (rawAssisters.length >= FETCH_LIMIT) break;
-        }
-
-        // Now take top 10 from the filtered lists
-        const filteredScorers = rawScorers
-          .map((d) => ({ userId: d.userId, count: Number(d.goals) || 0 }))
-          .slice(0, 10);
-
-        const filteredAssisters = rawAssisters
-          .map((d) => ({ userId: d.userId, count: Number(d.assists) || 0 }))
-          .slice(0, 10);
-
-        const pretty = prettyLeagueName(leagueSlug);
-        const scorersText = formatTopList(filteredScorers, "Goals", pretty);
-        const assistersText = formatTopList(filteredAssisters, "Assists", pretty);
-
-        // determine top players channel
-        const finalTopPlayersUrl = cfg.topPlayersChannelUrl || cfg.topPlayersUrl || cfg.url;
-        if (!finalTopPlayersUrl) {
-          results.skipped.push({ league: leagueSlug, reason: "no topPlayersChannelUrl/url on config" });
-          continue;
-        }
-
-        const match = finalTopPlayersUrl.match(/discord(?:app)?\.com\/channels\/\d+\/(\d+)/);
-        if (!match) {
-          results.skipped.push({ league: leagueSlug, reason: "invalid channel url in config", url: finalTopPlayersUrl });
-          continue;
-        }
-        const topChannelId = match[1];
-
-        const channel = await message.client.channels.fetch(topChannelId).catch(() => null);
-        if (!channel) {
-          results.skipped.push({ league: leagueSlug, reason: "failed to fetch channel", channelId: topChannelId });
-          continue;
-        }
-
-        // find existing bot messages by header (content or embed)
-        const recent = await channel.messages.fetch({ limit: 100 }).catch(() => null);
-        let scorerMsg = null;
-        let assisterMsg = null;
-        const scorerRegex = buildHeaderRegex(pretty, "Scorers");
-        const assisterRegex = buildHeaderRegex(pretty, "Assisters");
-
-        if (recent) {
-          for (const m of recent.values()) {
-            if (m.author?.id !== message.client.user?.id) continue;
-            const content = String(m.content || "");
-            if (!scorerMsg && scorerRegex.test(content)) scorerMsg = m;
-            if (!assisterMsg && assisterRegex.test(content)) assisterMsg = m;
-
-            if ((!scorerMsg || !assisterMsg) && m.embeds && m.embeds.length) {
-              for (const e of m.embeds) {
-                if (!scorerMsg && e.title && scorerRegex.test(String(e.title))) scorerMsg = m;
-                if (!assisterMsg && e.title && assisterRegex.test(String(e.title))) assisterMsg = m;
-                if (!scorerMsg && e.description && scorerRegex.test(String(e.description))) scorerMsg = m;
-                if (!assisterMsg && e.description && assisterRegex.test(String(e.description))) assisterMsg = m;
-                if (scorerMsg && assisterMsg) break;
-              }
-            }
-            if (scorerMsg && assisterMsg) break;
-          }
-        }
-
-        // edit/create
-        if (scorerMsg) {
-          await scorerMsg.edit(scorersText);
-          results.updated.push({ league: leagueSlug, section: "scorers", channel: topChannelId, count: filteredScorers.length });
-        } else {
-          await channel.send(scorersText);
-          results.created.push({ league: leagueSlug, section: "scorers", channel: topChannelId, count: filteredScorers.length });
-        }
-
-        if (assisterMsg) {
-          await assisterMsg.edit(assistersText);
-          results.updated.push({ league: leagueSlug, section: "assisters", channel: topChannelId, count: filteredAssisters.length });
-        } else {
-          await channel.send(assistersText);
-          results.created.push({ league: leagueSlug, section: "assisters", channel: topChannelId, count: filteredAssisters.length });
-        }
-      } catch (errInner) {
-        console.error("Error updating league config:", cfg, errInner);
-        results.errors.push({ cfg, error: String(errInner) });
+      const topScorers = [];
+      for (const s of scorers) {
+        if (await memberExists(s.userId)) topScorers.push({ userId: s.userId, count: s.goals });
+        if (topScorers.length === 10) break;
       }
-    } // end for
 
-    // close stats connection
-    try {
-      await statsConn.close();
-    } catch (e) {
-      // ignore
+      const topAssisters = [];
+      for (const a of assisters) {
+        if (await memberExists(a.userId))
+          topAssisters.push({ userId: a.userId, count: a.assists });
+        if (topAssisters.length === 10) break;
+      }
+
+      const pretty = prettyLeagueName(slug);
+
+      const scorersText = formatTopList(topScorers, "Goals", pretty);
+      const assistersText = formatTopList(topAssisters, "Assists", pretty);
+
+      const url = cfg.topPlayersChannelUrl || cfg.url;
+      if (!url) return;
+
+      const [, channelId] = url.match(/channels\/\d+\/(\d+)/) || [];
+      if (!channelId) return;
+
+      const channel = await message.client.channels.fetch(channelId);
+      const recent = await channel.messages.fetch({ limit: 50 });
+
+      let scorerMsg, assisterMsg;
+      const scorerRegex = buildHeaderRegex(`${SEASON_LABEL} ${pretty}`, "Scorers");
+      const assisterRegex = buildHeaderRegex(`${SEASON_LABEL} ${pretty}`, "Assisters");
+
+      for (const m of recent.values()) {
+        if (m.author.id !== message.client.user.id) continue;
+        if (!scorerMsg && scorerRegex.test(m.content)) scorerMsg = m;
+        if (!assisterMsg && assisterRegex.test(m.content)) assisterMsg = m;
+      }
+
+      if (scorerMsg) {
+        await scorerMsg.edit(scorersText);
+        results.updated.push(`${pretty} Scorers`);
+      } else {
+        await channel.send(scorersText);
+        results.created.push(`${pretty} Scorers`);
+      }
+
+      if (assisterMsg) {
+        await assisterMsg.edit(assistersText);
+        results.updated.push(`${pretty} Assisters`);
+      } else {
+        await channel.send(assistersText);
+        results.created.push(`${pretty} Assisters`);
+      }
     }
 
-    const summary = [
-      `✅ Top players update finished.`,
-      `• Sections edited: ${results.updated.length}`,
-      `• Sections created: ${results.created.length}`,
-      `• Skipped configs: ${results.skipped.length}`,
-      `• Errors: ${results.errors.length}`,
-      "",
-      `(If some leagues show no entries, check the "collectionName" field in the DB config or that players exist in the guild.)`,
-    ].join("\n");
+    for (const cfg of configs) {
+      if (String(cfg.league).toLowerCase() !== "all") {
+        await processSingleConfig(cfg);
+      }
+    }
 
-    return message.reply(summary);
+    await statsConn.close();
+
+    // ===== FINAL EMBED RESPONSE =====
+    const embed = new EmbedBuilder()
+      .setColor(0x2ecc71)
+      .setTitle("🏆 Top Players Updated")
+      .setDescription(
+        [
+          results.updated.length && `🔄 **Updated:** ${results.updated.length}`,
+          results.created.length && `✨ **Created:** ${results.created.length}`,
+        ]
+          .filter(Boolean)
+          .join("\n") || "No changes detected."
+      )
+      .setFooter({ text: SEASON_LABEL });
+
+    await statusMsg.edit({ content: null, embeds: [embed] });
   },
 };

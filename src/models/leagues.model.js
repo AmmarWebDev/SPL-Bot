@@ -29,6 +29,8 @@ const FACup = statsConnection.model("FACup", playerSchema, "FACup");
 const CoppaItalia = statsConnection.model("CoppaItalia", playerSchema, "CoppaItalia");
 const CoupeDeFrance = statsConnection.model("CoupeDeFrance", playerSchema, "CoupeDeFrance");
 const DFBPokal = statsConnection.model("DFBPokal", playerSchema, "DFBPokal");
+const CL = statsConnection.model("CL", playerSchema, "CL");
+const WC = statsConnection.model("WC", playerSchema, "WC");
 
 export const models = {
   "la-liga": LaLiga,
@@ -41,4 +43,6 @@ export const models = {
   "coppa-italia": CoppaItalia,
   "coupedefrance": CoupeDeFrance,
   "dfb-pokal": DFBPokal,
+  "wc": WC,
+  "cl": CL,
 };
